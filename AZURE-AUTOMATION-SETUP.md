@@ -1,705 +1,492 @@
 # Azure Automation Setup Guide
 
-Complete step-by-step guide to set up automated macOS compliance policy management in Azure Automation.
+Complete step-by-step guide to set up automated macOS and iOS/iPadOS compliance policy management in Azure Automation.
 
 ---
 
-## 🎯 Overview
+## Overview
 
-This guide covers:
-- ✅ Creating Azure Automation Account
-- ✅ Choosing authentication method (Managed Identity vs Service Principal)
-- ✅ Configuring permissions and variables
-- ✅ Uploading and testing the runbook
-- ✅ Scheduling automated execution
-- ✅ Monitoring and troubleshooting
+This guide covers the shared setup that applies to **both deployment options**:
 
-**Time required:** 15-20 minutes
+- Creating the Azure Automation Account
+- Choosing and configuring authentication (Managed Identity or Service Principal)
+- Configuring variables and uploading runbooks
+- Testing and scheduling
+
+**Two deployment options are available — choose one:**
+
+| | Separate Runbooks | Unified Runbook |
+|---|---|---|
+| Runbooks | One per platform | One for both platforms |
+| Schedules | Independent per platform | Single shared schedule |
+| Variables | `MACOS_*` and `IOS_*` sets | Same, plus `ENABLE_MACOS` / `ENABLE_IOS` |
+| Best for | Independent platform management | Simpler, single-job setup |
+| Setup guide | [`Separate-runbooks/SETUP-GUIDE.md`](Separate-runbooks/SETUP-GUIDE.md) | [`Unified-runbook/SETUP-GUIDE.md`](Unified-runbook/SETUP-GUIDE.md) |
+
+**Time required:** 15–20 minutes
 
 ---
 
-## 🔐 Choose Your Authentication Method
+## Choose Your Authentication Method
 
-The script supports two authentication methods:
+The same authentication method is used for both platforms. One setup covers everything.
 
-### Option A: Managed Identity ⭐ RECOMMENDED
+### Option A: Managed Identity — Recommended
 
-**Advantages:**
-- ✅ **Zero maintenance** - No credential rotation ever
-- ✅ **No secrets** - Nothing to expire or manage
-- ✅ **More secure** - No credentials stored anywhere
-- ✅ **Azure best practice** - Microsoft's recommended approach
-
-**Requirements:**
-- PowerShell/Cloud Shell access to grant permissions (one-time)
+- No credentials stored anywhere
+- Nothing expires — zero rotation required
+- Azure best practice
 
 ### Option B: Service Principal
 
-**Advantages:**
-- ✅ **Portal-only setup** - No PowerShell required
-- ✅ **Works everywhere** - Azure, local, CI/CD pipelines
+- Works standalone (local machine, CI/CD) in addition to Azure Automation
+- Client secret expires (max 24 months) — requires periodic rotation
 
-**Drawbacks:**
-- ⚠️ **Requires maintenance** - Client secret expires (24 months max)
-- ⚠️ **Manual rotation** - Must update secret before expiration
-- ⚠️ **Stored credential** - Secret saved in Automation variables
-
----
-
-**💡 Recommendation:** Use **Managed Identity** for production Azure Automation deployments. It's more secure and requires zero ongoing maintenance.
-
-Both methods are fully supported, and you can migrate from Service Principal to Managed Identity later (see `MANAGED-IDENTITY-MIGRATION.md`).
+**Recommendation:** Use Managed Identity for production. Both are fully supported and you can migrate later (see [`MANAGED-IDENTITY-MIGRATION.md`](MANAGED-IDENTITY-MIGRATION.md)).
 
 ---
 
 ## Part 1: Create Azure Automation Account
 
-### Step 1.1: Create the Account
-
 1. Go to [Azure Portal](https://portal.azure.com)
-2. Search for **"Automation Accounts"** and select it
-3. Click **+ Create**
-4. Configure:
+2. Search for **Automation Accounts** → **+ Create**
+3. Configure:
    - **Subscription**: Your subscription
-   - **Resource group**: Create new or select existing (e.g., `rg-automation`)
-   - **Name**: `intune-macos-automation`
-   - **Region**: Choose region closest to you
-5. Click **Review + Create** → **Create**
-6. Wait ~1 minute for deployment
+   - **Resource group**: New or existing (e.g. `rg-automation`)
+   - **Name**: `intune-compliance-automation`
+   - **Region**: Closest to you
+4. Click **Review + Create** → **Create**
+5. Wait ~1 minute for deployment
 
 ---
 
-## Part 2A: Set Up Managed Identity (RECOMMENDED)
-
-Follow this section if you chose **Managed Identity** authentication.
+## Part 2A: Set Up Managed Identity (Recommended)
 
 ### Step 2A.1: Enable System-Assigned Managed Identity
 
-1. Navigate to your **Automation Account**
-2. Go to **Identity** (under Account Settings)
-3. On the **System assigned** tab:
-   - Toggle **Status** to **On**
-   - Click **Save** → **Yes**
-4. **Copy the Object (principal) ID** - you'll need this next
+1. Open your Automation Account
+2. Go to **Identity** → **System assigned**
+3. Toggle **Status** to **On** → **Save** → **Yes**
+4. Copy the **Object (principal) ID** — needed in the next step
 
+### Step 2A.2: Grant Microsoft Graph Permission
 
-### Step 2A.2: Grant Microsoft Graph Permissions
-
-You need to grant the managed identity permission to read/write Intune compliance policies.
-
-**Using Azure Cloud Shell (PowerShell):**
-
-1. In Azure Portal, click the **Cloud Shell** icon (>_) in the top toolbar
-2. Select **PowerShell** environment
-3. Run the following commands:
+Open **Azure Cloud Shell** (PowerShell) and run:
 
 ```powershell
-# Install Microsoft Graph PowerShell module (if not already installed)
-if (!(Get-Module -ListAvailable -Name Microsoft.Graph)) {
-    Install-Module Microsoft.Graph -Scope CurrentUser -Force
-}
-
 # Connect to Microsoft Graph
 Connect-MgGraph -Scopes "Application.Read.All","AppRoleAssignment.ReadWrite.All"
 
-# Replace with your managed identity's Object ID from Step 2A.1
+# Replace with your managed identity Object ID from Step 2A.1
 $managedIdentityId = "PASTE-YOUR-OBJECT-ID-HERE"
 
-# Microsoft Graph application ID (always the same)
 $graphAppId = "00000003-0000-0000-c000-000000000000"
-
-# Get the Microsoft Graph service principal
-$graphSP = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
-
-# Get the permission ID for DeviceManagementConfiguration.ReadWrite.All
+$graphSP    = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
 $permission = $graphSP.AppRoles | Where-Object {
     $_.Value -eq "DeviceManagementConfiguration.ReadWrite.All"
 }
 
-# Grant the permission to the managed identity
 New-MgServicePrincipalAppRoleAssignment `
     -ServicePrincipalId $managedIdentityId `
-    -PrincipalId $managedIdentityId `
-    -ResourceId $graphSP.Id `
-    -AppRoleId $permission.Id
+    -PrincipalId        $managedIdentityId `
+    -ResourceId         $graphSP.Id `
+    -AppRoleId          $permission.Id
 
-Write-Host "✓ Permission granted successfully!" -ForegroundColor Green
+Write-Host "Permission granted"
 ```
 
-**Expected output:**
-```
-✓ Permission granted successfully!
-```
+This single permission covers both macOS and iOS/iPadOS compliance policies.
 
 ### Step 2A.3: Verify the Permission
 
-Confirm the permission was granted:
-
 ```powershell
-# Verify the assignment
 $assignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $managedIdentityId
-
-# Display the permission
-$assignments | Select-Object -First 1 | ForEach-Object {
-    $role = (Get-MgServicePrincipal -ServicePrincipalId $_.ResourceId).AppRoles | 
+$assignments | ForEach-Object {
+    $role = (Get-MgServicePrincipal -ServicePrincipalId $_.ResourceId).AppRoles |
             Where-Object Id -eq $_.AppRoleId
     [PSCustomObject]@{
-        Permission = $role.Value
+        Permission   = $role.Value
         ResourceName = (Get-MgServicePrincipal -ServicePrincipalId $_.ResourceId).DisplayName
     }
 }
 ```
 
-**Expected output:**
+Expected output:
 ```
 Permission                                      ResourceName
 ----------                                      ------------
 DeviceManagementConfiguration.ReadWrite.All     Microsoft Graph
 ```
 
-✅ **You're done with authentication setup! Skip to Part 3.**
+**Skip to Part 3.**
 
 ---
 
-## Part 2B: Set Up Service Principal (ALTERNATIVE)
-
-Follow this section if you chose **Service Principal** authentication.
+## Part 2B: Set Up Service Principal (Alternative)
 
 ### Step 2B.1: Create App Registration
 
-1. Go to **Azure Active Directory**
-2. Navigate to **App registrations** → **New registration**
-3. Configure:
-   - **Name**: `Intune-macOS-Compliance-Automation`
-   - **Supported account types**: Accounts in this organizational directory only
-   - **Redirect URI**: Leave blank
-4. Click **Register**
+1. Go to **Azure Active Directory** → **App registrations** → **New registration**
+2. Configure:
+   - **Name**: `Intune-Compliance-Automation`
+   - **Supported account types**: This directory only
+3. Click **Register**
 
-### Step 2B.2: Grant API Permissions
+### Step 2B.2: Grant API Permission
 
-1. In your new app registration, go to **API permissions**
-2. Click **Add a permission**
-3. Select **Microsoft Graph** → **Application permissions**
-4. Search for and check: **`DeviceManagementConfiguration.ReadWrite.All`**
-5. Click **Add permissions**
-6. Click **Grant admin consent for [Your Organization]**
-7. Confirm by clicking **Yes**
-
-**Verify:** You should see a green checkmark in the "Status" column.
+1. Go to **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions**
+2. Search for and add: `DeviceManagementConfiguration.ReadWrite.All`
+3. Click **Grant admin consent for [Your Organization]** → **Yes**
 
 ### Step 2B.3: Create Client Secret
 
-1. Go to **Certificates & secrets** → **Client secrets** tab
-2. Click **New client secret**
-3. Configure:
-   - **Description**: `Intune Compliance Automation`
-   - **Expires**: 24 months (or your preference)
-4. Click **Add**
-5. **⚠️ CRITICAL**: Immediately copy the **Value** (you can't see it again!)
+1. Go to **Certificates & secrets** → **Client secrets** → **New client secret**
+2. Set expiry (24 months recommended)
+3. Click **Add**
+4. **Copy the Value immediately** — it is shown only once
 
-### Step 2B.4: Collect Required IDs
+### Step 2B.4: Collect Required Values
 
-You'll need these three values:
-
-1. **Tenant ID**:
-   - Go to **Azure Active Directory** → **Overview**
-   - Copy the **Tenant ID**
-
-2. **Client ID**:
-   - Go to your **App Registration** → **Overview**
-   - Copy the **Application (client) ID**
-
-3. **Client Secret**:
-   - The value you copied in Step 2B.3
-
-**📝 Save these securely** - you'll need them in Part 3.
+You will need:
+- **Tenant ID**: Azure Active Directory → Overview → Tenant ID
+- **Client ID**: App Registration → Overview → Application (client) ID
+- **Client Secret**: Value copied in Step 2B.3
 
 ---
 
-## Part 3: Configure Automation Variables
+## Part 3: Get Your Compliance Policy IDs
 
-### Step 3.1: Get Your Compliance Policy ID
+Before creating variables, collect the policy GUIDs from Intune.
 
-Before creating variables, get your policy ID:
+1. Go to [Intune](https://intune.microsoft.com) → **Devices** → **Compliance** → **Policies**
+2. Click each policy you want to manage
+3. Copy the GUID from the URL:
 
-1. Go to [Intune Portal](https://intune.microsoft.com)
-2. Navigate to: **Devices** → **Compliance** → **Policies**
-3. Click on your macOS compliance policy
-4. Copy the **GUID** from the URL bar
-
-Example URL:
 ```
-https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings/DeviceCompliancePolicyMenuBlade/.../policyId/36b9b86c-2297-4c2c-9b25-8c023f9d4d57
-                                                                                                          ↑ This is your Policy ID
+…/policyId/36b9b86c-2297-4c2c-9b25-8c023f9d4d57
+           ↑ this is your Policy ID
 ```
 
-### Step 3.2: Create Variables
+You will need one GUID per platform (macOS and/or iOS/iPadOS).
+
+---
+
+## Part 4: Configure Automation Variables
 
 Navigate to your **Automation Account** → **Variables** (under Shared Resources).
 
----
+### Shared Variables — Required for All
 
-#### For ALL Users (Required)
+These apply regardless of which deployment option you choose.
 
-**Variable 1: INTUNE_POLICY_ID**
-- Click **+ Add a variable**
-- **Name**: `INTUNE_POLICY_ID`
-- **Description**: `Intune macOS Compliance Policy ID`
-- **Type**: String
-- **Value**: Your policy GUID (from Step 3.1)
-- **Encrypted**: No
-- Click **Create**
+**`USE_MANAGED_IDENTITY`**
+- Type: Boolean
+- Value: `True` (Managed Identity) or `False` (Service Principal)
+- Encrypted: No
 
-**Variable 2: USE_MANAGED_IDENTITY**
-- Click **+ Add a variable**
-- **Name**: `USE_MANAGED_IDENTITY`
-- **Description**: `Use managed identity for authentication`
-- **Type**: Boolean
-- **Value**: 
-  - `True` if using Managed Identity (Part 2A)
-  - `False` if using Service Principal (Part 2B)
-- **Encrypted**: No
-- Click **Create**
+**Service Principal only — skip if using Managed Identity:**
+
+**`INTUNE_TENANT_ID`** — Type: String, Encrypted: No
+
+**`INTUNE_CLIENT_ID`** — Type: String, Encrypted: No
+
+**`INTUNE_CLIENT_SECRET`** — Type: String, **Encrypted: Yes**
 
 ---
 
-#### For Service Principal Users ONLY
+### Separate Runbooks — Platform Variables
 
-If you set `USE_MANAGED_IDENTITY = False`, also create these:
+#### macOS Variables
 
-**Variable 3: INTUNE_TENANT_ID**
-- **Name**: `INTUNE_TENANT_ID`
-- **Type**: String
-- **Value**: Your Azure AD Tenant ID
-- **Encrypted**: No
+**`MACOS_POLICY_ID`** — Required
+- Type: String
+- Value: Your macOS compliance policy GUID
+- Encrypted: No
 
-**Variable 4: INTUNE_CLIENT_ID**
-- **Name**: `INTUNE_CLIENT_ID`
-- **Type**: String
-- **Value**: Your App Registration Client ID
-- **Encrypted**: No
+**`MACOS_PIN_TO_MAJOR_VERSION`** — Recommended
+- Type: Integer
+- Value: e.g. `26`
+- Purpose: Pin to a specific macOS major version; ignores newer major versions
 
-**Variable 5: INTUNE_CLIENT_SECRET**
-- **Name**: `INTUNE_CLIENT_SECRET`
-- **Type**: String
-- **Value**: Your Client Secret
-- **Encrypted**: **Yes** ⚠️ **IMPORTANT: Check this box!**
+**`MACOS_VERSIONS_BELOW`** — Optional (default: `2`)
+- Type: Integer
+- Value: How many versions behind the latest to require
 
----
+**`MACOS_USE_MINOR_VERSIONS`** — Optional (default: `False`)
+- Type: Boolean
+- Value: `True` to track minor versions instead of major versions
 
-#### Optional Configuration (All Users)
+#### iOS/iPadOS Variables
 
-These variables customize the version tracking behavior:
+**`IOS_POLICY_ID`** — Required
+- Type: String
+- Value: Your iOS/iPadOS compliance policy GUID
+- Encrypted: No
 
-**Variable 6: PIN_TO_MAJOR_VERSION** ⭐ RECOMMENDED
-- **Name**: `PIN_TO_MAJOR_VERSION`
-- **Type**: Integer
-- **Value**: `26` (or your target major version)
-- **Encrypted**: No
-- **Description**: Pin to specific macOS major version
+**`IOS_PIN_TO_MAJOR_VERSION`** — Recommended
+- Type: Integer
+- Value: e.g. `18`
 
-**Why pin?** Controls OS rollout. Set to `26` to track only macOS 26.x versions and ignore macOS 27.x. Perfect for testing new OS on pilot group while keeping production stable.
+**`IOS_VERSIONS_BELOW`** — Optional (default: `2`)
+- Type: Integer
 
-**Variable 7: VERSIONS_BELOW**
-- **Name**: `VERSIONS_BELOW`
-- **Type**: Integer
-- **Value**: `2` (how many versions behind latest)
-- **Encrypted**: No
-- **Default**: 2 if not specified
-
-**Variable 8: USE_MINOR_VERSIONS**
-- **Name**: `USE_MINOR_VERSIONS`
-- **Type**: Boolean
-- **Value**: `False`
-- **Encrypted**: No
-- **Default**: False if not specified
+**`IOS_USE_MINOR_VERSIONS`** — Optional (default: `False`)
+- Type: Boolean
 
 ---
 
-### Step 3.3: Variable Summary
+### Unified Runbook — All Variables
 
-**Managed Identity setup:**
-- `INTUNE_POLICY_ID` ✅ Required
-- `USE_MANAGED_IDENTITY = True` ✅ Required
-- `PIN_TO_MAJOR_VERSION` ⭐ Recommended
-- `VERSIONS_BELOW` (optional)
+All variables from Separate Runbooks above, plus:
 
-**Service Principal setup:**
-- `INTUNE_POLICY_ID` ✅ Required
-- `USE_MANAGED_IDENTITY = False` ✅ Required
-- `INTUNE_TENANT_ID` ✅ Required
-- `INTUNE_CLIENT_ID` ✅ Required
-- `INTUNE_CLIENT_SECRET` ✅ Required (encrypted!)
-- `PIN_TO_MAJOR_VERSION` ⭐ Recommended
-- `VERSIONS_BELOW` (optional)
+**`ENABLE_MACOS`** — Required
+- Type: Boolean
+- Value: `True` to process macOS, `False` to skip
 
----
+**`ENABLE_IOS`** — Required
+- Type: Boolean
+- Value: `True` to process iOS/iPadOS, `False` to skip
 
-## Part 4: Upload the Runbooks
-
-### Step 4.1: Create Main Runbook
-
-1. In your Automation Account, go to **Runbooks** (under Process Automation)
-2. Click **+ Create a runbook**
-3. Configure:
-   - **Name**: `Update-macOS-Compliance-Policy`
-   - **Runbook type**: PowerShell
-   - **Runtime version**: **7.2** (or 5.1 if unavailable)
-   - **Description**: `Automatically updates Intune macOS compliance policy based on SOFA feed`
-4. Click **Create**
-
-### Step 4.2: Upload Main Script
-
-1. The editor opens automatically
-2. Copy the entire contents of **`Update-IntuneMacOSCompliance.ps1`**
-3. Paste into the editor
-4. Click **Save**
-5. Click **Publish** → **Yes**
-
-### Step 4.3: Create Diagnostics Runbook (Recommended)
-
-1. Click **+ Create a runbook** again
-2. Configure:
-   - **Name**: `Diagnostics-macOS-Compliance`
-   - **Runbook type**: PowerShell
-   - **Runtime version**: 7.2 (or 5.1)
-   - **Description**: `Pre-flight diagnostics for compliance automation`
-3. Click **Create**
-4. Copy contents of **`Diagnostics-Runbook.ps1`**
-5. Paste, **Save**, **Publish**
+**Minimum variable set (Managed Identity, both platforms):**
+```
+USE_MANAGED_IDENTITY         = True
+ENABLE_MACOS                 = True
+ENABLE_IOS                   = True
+MACOS_POLICY_ID              = <your-macos-policy-guid>
+IOS_POLICY_ID                = <your-ios-policy-guid>
+MACOS_PIN_TO_MAJOR_VERSION   = 26
+IOS_PIN_TO_MAJOR_VERSION     = 18
+```
 
 ---
 
-## Part 5: Test the Setup
+## Part 5: Upload the Runbooks
 
-### Step 5.1: Run Diagnostics First
+Navigate to your **Automation Account** → **Runbooks** → **+ Create a runbook**.
 
-Before testing the main script, verify your configuration:
+Use **PowerShell** type and **Runtime version 7.2** for all runbooks.
 
-1. Go to **Runbooks** → **Diagnostics-macOS-Compliance**
-2. Click **Start**
-3. Watch the output - all 5 steps should pass:
+### Separate Runbooks
 
-**Expected output (Managed Identity):**
+| Runbook Name | Script File | Description |
+|---|---|---|
+| `Update-macOS-Compliance` | `Separate-runbooks/Scripts/Update-IntuneMacOSCompliance.ps1` | Updates macOS compliance policy |
+| `Update-iOS-Compliance` | `Separate-runbooks/Scripts/Update-IntuneIOSCompliance.ps1` | Updates iOS/iPadOS compliance policy |
+| `Diagnostics-macOS` | `Separate-runbooks/Scripts/Diagnostics-macOS.ps1` | Pre-flight checks for macOS |
+| `Diagnostics-iOS` | `Separate-runbooks/Scripts/Diagnostics-iOS.ps1` | Pre-flight checks for iOS |
+
+### Unified Runbook
+
+| Runbook Name | Script File | Description |
+|---|---|---|
+| `Update-IntuneCompliance-Unified` | `Unified-runbook/Scripts/Update-IntuneCompliance-Unified.ps1` | Updates both platforms |
+| `Diagnostics-Unified` | `Unified-runbook/Scripts/Diagnostics-Unified.ps1` | Pre-flight checks for both platforms |
+
+For each runbook: paste the script content → **Save** → **Publish**.
+
+---
+
+## Part 6: Test the Setup
+
+### Run Diagnostics First
+
+Always run diagnostics before the main script to verify each component.
+
+**Separate Runbooks:** Run `Diagnostics-macOS` and/or `Diagnostics-iOS`.
+
+**Unified Runbook:** Run `Diagnostics-Unified`.
+
+All 5 steps should pass. Example output (Unified, Managed Identity):
+
 ```
 [STEP 1] Loading Azure Automation Variables...
-✓ Managed Identity mode detected
-  Authentication: System-assigned managed identity
-  No credentials needed
-  Policy ID: 36b9b86c...
+  USE_MANAGED_IDENTITY: True
+  ENABLE_MACOS:         True
+  ENABLE_IOS:           True
+  Authentication: Managed Identity
+  MACOS_POLICY_ID: 2ede6410...
+  IOS_POLICY_ID:   c595dd05...
+  RESULT: Variables loaded successfully
 
 [STEP 2] Testing Microsoft Graph Authentication...
-Using Managed Identity authentication...
-✓ Authentication successful (Managed Identity)
-  Token type: Bearer
-  Token length: 2016 chars
+  Method: Managed Identity
+  RESULT: Authentication successful
 
 [STEP 3] Testing Microsoft Graph API Permissions...
-✓ API access successful
-  Found 3 compliance policies
+  macOS policies: 3
+  iOS policies:   2
+  RESULT: API access successful
 
-[STEP 4] Testing Access to Target Policy...
-✓ Policy access successful
-  Policy Name: macOS Compliance OS Version
-  Current Minimum OS: 26.3.2
+[STEP 4] Testing Access to Target Policies...
+  macOS Policy... Is macOS: True   RESULT: OK
+  iOS/iPadOS Policy... Is iOS/iPadOS: True   RESULT: OK
 
-[STEP 5] Testing SOFA API Access...
-✓ SOFA API accessible
-  Retrieved 118 macOS versions
-
-=========================================
-DIAGNOSTICS COMPLETE
-=========================================
+[STEP 5] Testing SOFA Feed Access...
+  macOS Feed... RESULT: OK
+  iOS/iPadOS Feed... RESULT: OK
 ```
 
-**If any step fails:** See Troubleshooting section below.
+### Run the Main Script
 
-### Step 5.2: Run Main Script
+Once diagnostics pass, run the main runbook. Expected JSON summary output:
 
-1. Go to **Runbooks** → **Update-macOS-Compliance-Policy**
-2. Click **Start**
-3. Leave parameters empty (uses variables)
-4. Click **OK**
-5. Monitor the job output
-
-### Step 5.3: Verify Execution Summary
-
-At the end, you should see:
-
-**Managed Identity:**
 ```json
 {
   "Success": true,
-  "PolicyId": "36b9b86c-2297-4c2c-9b25-8c023f9d4d57",
-  "PreviousVersion": "26.3.2",
-  "NewVersion": "26.3.2",
-  "Updated": false,
   "AuthMethod": "Managed Identity",
-  "Duration": 4.5,
-  "Timestamp": "2026-04-05T11:00:39Z"
+  "Results": {
+    "macOS": {
+      "Success": true,
+      "PreviousVersion": "26.3.0",
+      "NewVersion": "26.4.0",
+      "Updated": true
+    },
+    "iOS": {
+      "Success": true,
+      "PreviousVersion": "18.3.0",
+      "NewVersion": "18.3.2",
+      "Updated": true
+    }
+  }
 }
 ```
 
-**Service Principal:**
-```json
-{
-  "Success": true,
-  "PolicyId": "36b9b86c-...",
-  "PreviousVersion": "26.3.2",
-  "NewVersion": "26.4.0",
-  "Updated": true,
-  "AuthMethod": "Service Principal",
-  "Duration": 6.2,
-  "Timestamp": "2026-04-05T11:00:39Z"
-}
-```
+---
 
-**Key field:** `AuthMethod` confirms which authentication was used.
+## Part 7: Schedule Automated Execution
 
-### Step 5.4: Enable Verbose Logging (Optional)
+### Create a Schedule
 
-To see detailed execution flow:
+1. Automation Account → **Schedules** → **+ Add a schedule**
+2. Example: `Weekly-Tuesday-2AM`
+   - Recurrence: Weekly, Tuesday, 02:00
+   - Time zone: your local zone
+3. **Create**
 
-1. Go to your runbook → **Settings**
-2. Set **Log verbose records** to **On**
-3. Click **Save**
+### Link to Runbooks
 
-Next run will show detailed authentication and processing logs.
+- **Separate Runbooks:** Link the schedule to both `Update-macOS-Compliance` and `Update-iOS-Compliance` (or just the ones you are using)
+- **Unified Runbook:** Link to `Update-IntuneCompliance-Unified` once
+
+Open each runbook → **Schedules** → **+ Add a schedule** → select your schedule → **OK**.
 
 ---
 
-## Part 6: Schedule Automated Execution
+## Part 8: Monitoring (Optional)
 
-### Step 6.1: Create a Schedule
+### Failure Alerts
 
-1. In your Automation Account, go to **Schedules** (under Shared Resources)
-2. Click **+ Add a schedule**
-3. Click **Create a new schedule**
-4. Configure:
-   - **Name**: `Weekly-Tuesday-2AM`
-   - **Description**: `Weekly check for macOS version updates`
-   - **Starts**: Next Tuesday
-   - **Time**: `02:00`
-   - **Time zone**: Your time zone
-   - **Recurrence**: Recurring
-   - **Recur every**: 1 Week
-   - **On these days**: Tuesday only
-   - **Set expiration**: No
-5. Click **Create**
+1. Automation Account → **Alerts** → **+ New alert rule**
+2. Condition: **Job failed**
+3. Action group: email or Teams webhook notification
+4. Name: `Compliance Update Failed`
 
-### Step 6.2: Link Schedule to Runbook
+### View Job History
 
-1. Go to your runbook → **Schedules** (under Resources)
-2. Click **+ Add a schedule**
-3. Select **Weekly-Tuesday-2AM**
-4. Leave parameters empty
-5. Click **OK**
+Automation Account → **Jobs** — all runs with status, duration, and full output logs.
 
-✅ The runbook will now run automatically every Tuesday at 2 AM.
-
----
-
-## Part 7: Set Up Monitoring (Optional)
-
-### Step 7.1: Configure Failure Alerts
-
-Get notified if the automation fails:
-
-1. In your Automation Account, go to **Alerts** (under Monitoring)
-2. Click **+ New alert rule**
-3. **Condition**: Select "Job failed"
-4. **Actions**: 
-   - Create new action group
-   - Add email notification or Teams webhook
-5. **Alert rule name**: `macOS Compliance Update Failed`
-6. Click **Create**
-
-### Step 7.2: View Job History
-
-Monitor past executions:
-
-1. Go to **Automation Account** → **Jobs**
-2. See all runs with status (Completed, Failed, etc.)
-3. Click any job to see:
-   - Execution summary (JSON output)
-   - Full logs
-   - Error details (if failed)
-
-### Step 7.3: Query Logs (Advanced)
-
-If you enabled Log Analytics:
+### Log Analytics Query
 
 ```kusto
 AzureDiagnostics
 | where ResourceProvider == "MICROSOFT.AUTOMATION"
 | where Category == "JobLogs"
-| where RunbookName_s == "Update-macOS-Compliance-Policy"
+| where RunbookName_s in ("Update-macOS-Compliance", "Update-iOS-Compliance", "Update-IntuneCompliance-Unified")
 | project TimeGenerated, ResultType, RunbookName_s
 | order by TimeGenerated desc
-| take 10
+| take 20
 ```
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
-### Diagnostics: "Failed to load variables"
+### "Failed to load variables"
 
-**Cause:** Variables don't exist or have wrong names.
+- Check variable names are spelled correctly (case-sensitive)
+- **Separate Runbooks:** `MACOS_POLICY_ID` and `IOS_POLICY_ID` must exist separately
+- **Unified Runbook:** `ENABLE_MACOS`, `ENABLE_IOS` must also exist
+- Service Principal mode requires `INTUNE_TENANT_ID`, `INTUNE_CLIENT_ID`, `INTUNE_CLIENT_SECRET`
 
-**Fix:**
-- Verify variable names exactly match (case-sensitive)
-- For Managed Identity: Need `INTUNE_POLICY_ID` and `USE_MANAGED_IDENTITY = True`
-- For Service Principal: Need all 5 credential variables
-- Check for typos or extra spaces
+### "Authentication failed" — Managed Identity
 
-### Diagnostics: "Failed to authenticate using Managed Identity"
+1. Verify **Identity → System assigned** is **On**
+2. Re-run the permission grant command from Part 2A.2
+3. Wait 5–10 minutes for Azure to propagate permissions
+4. Retry
 
-**Cause:** Managed identity not enabled or permissions not granted.
+### "Authentication failed" — Service Principal
 
-**Fix:**
-1. Verify **Identity** → **System assigned** is **On**
-2. Re-run PowerShell permission grant command
-3. Verify permission with `Get-MgServicePrincipalAppRoleAssignment`
-4. Wait 5-10 minutes for Azure to propagate permissions
-5. Restart the runbook job
+1. Check the client secret has not expired (App Registration → Certificates & secrets)
+2. Verify `INTUNE_TENANT_ID` and `INTUNE_CLIENT_ID` are correct
+3. Verify admin consent was granted (green checkmark in API permissions)
+4. Wait 5 minutes after granting consent
 
-### Diagnostics: "Failed to authenticate to Microsoft Graph" (Service Principal)
+### "403 Forbidden" on API call
 
-**Cause:** Invalid credentials or missing permissions.
+- The identity does not have `DeviceManagementConfiguration.ReadWrite.All`
+- **Managed Identity:** re-run the grant command from Part 2A.2
+- **Service Principal:** click Grant admin consent in API permissions
+- Wait 5–10 minutes
 
-**Fix:**
-1. Verify Tenant ID is correct (Azure AD → Overview)
-2. Verify Client ID is correct (App Registration → Overview)
-3. Check Client Secret hasn't expired (Certificates & secrets)
-4. Ensure admin consent was granted (API permissions → green checkmark)
-5. Wait 5 minutes after granting consent
+### "404 Not Found" on policy access
 
-### Diagnostics: "API access failed - 403 Forbidden"
+- The policy GUID in `MACOS_POLICY_ID` or `IOS_POLICY_ID` is incorrect
+- Go to Intune → Devices → Compliance → Policies → click the policy → copy GUID from URL
 
-**Cause:** Permission not granted or consent missing.
+### Policy type mismatch warning
 
-**Fix:**
-- **Managed Identity**: Re-run permission grant command from Part 2A.2
-- **Service Principal**: Click "Grant admin consent" in API permissions
-- Wait 5-10 minutes for permissions to propagate
-- Verify permission type is **Application** (not Delegated)
+The diagnostics script checks that each policy ID points to the correct platform type.
+- `MACOS_POLICY_ID` must point to a `#microsoft.graph.macOSCompliancePolicy`
+- `IOS_POLICY_ID` must point to a `#microsoft.graph.iosCompliancePolicy`
 
-### Diagnostics: "Policy access failed - 404 Not Found"
+### Runbook completes with no output
 
-**Cause:** Incorrect Policy ID.
+This usually means Azure Automation was not detected and the script ran in standalone mode, failing silently. Verify:
+- The probe variable exists (`MACOS_POLICY_ID` for the macOS runbook, `IOS_POLICY_ID` for iOS, `ENABLE_MACOS` for Unified)
+- Variable names have no typos or extra spaces
 
-**Fix:**
-1. Go to Intune → Devices → Compliance → Policies
-2. Click your macOS policy
-3. Copy GUID from URL
-4. Update `INTUNE_POLICY_ID` variable
-5. Ensure no extra spaces or characters
+### "SOFA API failed"
 
-### Diagnostics: "SOFA API failed"
-
-**Cause:** Network connectivity issue or SOFA temporary outage.
-
-**Fix:**
-- Check Automation Account network settings
-- SOFA updates every 6 hours - may be brief maintenance
-- Verify URL accessible: https://sofa.macadmins.io/v2/macos_data_feed.json
-- Wait 10 minutes and retry
-- Check SOFA status: https://sofa.macadmins.io
-
-### Main Script: Shows wrong AuthMethod
-
-**Symptom:** Expected "Managed Identity" but shows "Service Principal"
-
-**Cause:** `USE_MANAGED_IDENTITY` variable not set correctly.
-
-**Fix:**
-1. Go to Variables → `USE_MANAGED_IDENTITY`
-2. Verify Type is **Boolean** (not String)
-3. Verify Value is `True` (not "True" with quotes)
-4. Re-save if needed
-5. Test again
-
-### Main Script: "Configuration incomplete"
-
-**Managed Identity:**
-- Missing `INTUNE_POLICY_ID` variable
-
-**Service Principal:**
-- Missing `INTUNE_TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, or `POLICY_ID`
-
-### Job keeps failing silently
-
-1. Go to the failed job
-2. Check **Output** stream for errors
-3. Check **Error** stream for exceptions
-4. Enable verbose logging (Settings → Log verbose records → On)
-5. Run diagnostics to isolate the issue
+SOFA is maintained by the MacAdmins community and updated every 6 hours. Transient outages are possible. The scheduled runbook retries automatically on its next execution. Verify: `https://sofa.macadmins.io`
 
 ---
 
-## 🔄 Ongoing Maintenance
+## Ongoing Maintenance
 
-### Managed Identity: Zero Maintenance! 🎉
+### Managed Identity: Zero Maintenance
 
-If using Managed Identity:
-- ✅ Nothing expires
-- ✅ No secrets to rotate
-- ✅ No calendar reminders needed
-- ✅ Just monitor job history
+Nothing to rotate. Monitor job history periodically.
 
 ### Service Principal: Secret Rotation
 
-If using Service Principal, rotate the secret before expiration:
+When the client secret nears expiry:
+1. App Registration → **Certificates & secrets** → create new secret
+2. Copy the new value
+3. Update `INTUNE_CLIENT_SECRET` in Automation Variables
+4. Test a runbook manually
+5. Once confirmed working, delete the old secret
 
-**30 days before expiration:**
+One rotation covers all platforms — both runbooks share the same credential variables.
 
-1. Go to App Registration → **Certificates & secrets**
-2. Create a new client secret (24 months)
-3. Copy the new secret value
-4. Update `INTUNE_CLIENT_SECRET` variable in Automation Account
-5. Test the runbook manually
-6. Once confirmed working, delete the old secret
-7. Set new calendar reminder for next rotation
+### Change Version Strategy
 
-### Update the Script
+Update the relevant variable (e.g. `MACOS_PIN_TO_MAJOR_VERSION`) in Automation Variables. No runbook re-publishing required — takes effect on the next execution.
 
-When new versions are released:
+### Enable or Disable a Platform
 
-1. Download latest `Update-IntuneMacOSCompliance.ps1`
-2. Go to runbook → **Edit**
-3. Select all (Ctrl+A) and delete
-4. Paste new script
-5. **Save** → **Publish**
-6. Run diagnostics to verify
-7. Test manually
-8. Monitor next scheduled run
-
-### Change Configuration
-
-Update version tracking behavior:
-
-1. Go to **Variables**
-2. Click variable name (e.g., `PIN_TO_MAJOR_VERSION`)
-3. Change value
-4. Click **Save**
-5. No need to republish runbook - takes effect next run
-
-### Migrate to Managed Identity
-
-If currently using Service Principal and want to switch:
-
-See **`MANAGED-IDENTITY-MIGRATION.md`** for complete step-by-step migration guide.
-
-**Benefits:**
-- Eliminate secret rotation forever
-- Improve security posture
-- Reduce operational overhead
-- Easy rollback if needed
+- **Separate Runbooks:** Disable or delete the individual runbook's schedule
+- **Unified Runbook:** Set `ENABLE_MACOS` or `ENABLE_IOS` to `False` — takes effect immediately on the next run
 
 ---
 
-## 📚 Additional Resources
+## Additional Resources
+
+**Setup Guides:**
+- [`Separate-runbooks/SETUP-GUIDE.md`](Separate-runbooks/SETUP-GUIDE.md) — Separate Runbooks
+- [`Unified-runbook/SETUP-GUIDE.md`](Unified-runbook/SETUP-GUIDE.md) — Unified Runbook
+- [`STANDALONE-USAGE.md`](STANDALONE-USAGE.md) — Local/standalone execution
+- [`MANAGED-IDENTITY-MIGRATION.md`](MANAGED-IDENTITY-MIGRATION.md) — Migrate from service principal
 
 **Microsoft Documentation:**
 - [Azure Automation](https://docs.microsoft.com/azure/automation/)
@@ -707,49 +494,5 @@ See **`MANAGED-IDENTITY-MIGRATION.md`** for complete step-by-step migration guid
 - [Microsoft Graph API](https://docs.microsoft.com/graph/)
 - [Intune Compliance Policies](https://docs.microsoft.com/mem/intune/protect/device-compliance-get-started)
 
-**Community Resources:**
-- [SOFA Feed](https://sofa.macadmins.io) - MacAdmins Open Source
-- [SOFA Documentation](https://sofa.macadmins.io/getting-started)
-
-**This Repository:**
-- `README.md` - Overview and quick start
-- `STANDALONE-USAGE.md` - Local execution guide
-- `MANAGED-IDENTITY-MIGRATION.md` - Migration from service principal
-- `VERSION-STRATEGIES.md` - Detailed versioning strategies
-
----
-
-## 💡 Pro Tips
-
-1. **Start with Managed Identity** - Save yourself future maintenance
-2. **Pin to major version** - Control OS rollout with `PIN_TO_MAJOR_VERSION`
-3. **Enable verbose logging** - See authentication method and detailed flow
-4. **Run diagnostics after changes** - Catch issues before scheduled run
-5. **Monitor the AuthMethod field** - Confirm correct authentication
-6. **Schedule during low-usage hours** - Minimize user impact
-7. **Set up failure alerts** - Know immediately if something breaks
-8. **Test version pinning strategy** - Use pilot group before production
-
----
-
-## 🆘 Getting Help
-
-**Step-by-step debugging:**
-
-1. **Run diagnostics** - Identifies exactly where the problem is
-2. **Check job output** - Full execution log with error details
-3. **Enable verbose logging** - See authentication and API calls
-4. **Verify variables** - Ensure correct names, types, and values
-5. **Check permissions** - Managed Identity or App Registration
-6. **Review this guide** - Troubleshooting section covers common issues
-7. **Test manually** - Run on-demand before relying on schedule
-
-**Common patterns:**
-- Authentication fails → Check Part 2 setup
-- Variables missing → Check Part 3 configuration
-- Policy not found → Verify Policy ID from Intune URL
-- SOFA API fails → Network or temporary outage
-
----
-
-**You're all set! Your macOS compliance automation is now running with zero maintenance required.** 
+**Community:**
+- [SOFA Feed](https://sofa.macadmins.io)
