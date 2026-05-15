@@ -12,8 +12,30 @@
 
 .NOTES
     Author: Niklas Bruhn (SSMacAdmin.com)
-    Version: 4.0
+    Version: 4.1.0
 #>
+
+function ConvertTo-RunbookBoolean {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return $Value }
+
+    $stringValue = $Value.ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) { return $Default }
+
+    switch -Regex ($stringValue) {
+        '^(true|1|yes|y)$'  { return $true }
+        '^(false|0|no|n)$'  { return $false }
+        default             { return $Default }
+    }
+}
 
 Write-Output "========================================="
 Write-Output "Unified Compliance Runbook Diagnostics"
@@ -29,7 +51,7 @@ try {
     $useManagedIdentity = $false
     try {
         $miVar = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
-        if ($null -ne $miVar) { $useManagedIdentity = [bool]$miVar }
+        if ($null -ne $miVar) { $useManagedIdentity = ConvertTo-RunbookBoolean -Value $miVar }
     } catch { }
 
     # Platform toggles
@@ -37,11 +59,11 @@ try {
     $enableIOS   = $false
     try {
         $enMac = Get-AutomationVariable -Name "ENABLE_MACOS" -ErrorAction SilentlyContinue
-        if ($null -ne $enMac) { $enableMacOS = [bool]$enMac }
+        if ($null -ne $enMac) { $enableMacOS = ConvertTo-RunbookBoolean -Value $enMac }
     } catch { }
     try {
         $enIOS = Get-AutomationVariable -Name "ENABLE_IOS" -ErrorAction SilentlyContinue
-        if ($null -ne $enIOS) { $enableIOS = [bool]$enIOS }
+        if ($null -ne $enIOS) { $enableIOS = ConvertTo-RunbookBoolean -Value $enIOS }
     } catch { }
 
     Write-Output "  USE_MANAGED_IDENTITY: $useManagedIdentity"

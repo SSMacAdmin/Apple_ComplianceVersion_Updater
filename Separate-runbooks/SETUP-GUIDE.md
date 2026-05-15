@@ -95,10 +95,10 @@ Navigate to your **Automation Account → Variables**.
 
 | Variable | Type | Value | Required |
 |---|---|---|---|
-| `INTUNE_POLICY_ID` | String | macOS compliance policy GUID | Required |
-| `PIN_TO_MAJOR_VERSION` | Integer | e.g. `26` | Recommended |
-| `VERSIONS_BELOW` | Integer | `2` | Optional |
-| `USE_MINOR_VERSIONS` | Boolean | `False` | Optional |
+| `MACOS_POLICY_ID` | String | macOS compliance policy GUID | Required |
+| `MACOS_PIN_TO_MAJOR_VERSION` | Integer | e.g. `26` | Recommended |
+| `MACOS_VERSIONS_BELOW` | Integer | `2` | Optional |
+| `MACOS_USE_MINOR_VERSIONS` | Boolean | `False` | Optional |
 
 **How to get your macOS Policy ID:**
 1. Go to [Intune](https://intune.microsoft.com) → Devices → Compliance → Policies
@@ -121,7 +121,7 @@ Navigate to your **Automation Account → Variables**.
 2. Click your iOS/iPadOS policy
 3. Copy the GUID from the URL
 
-> **iOS-specific variables are prefixed with `IOS_`** to clearly distinguish them from macOS variables in the same Automation Account.
+> Platform-specific variables are prefixed with `MACOS_` or `IOS_` to keep both runbooks clear in the same Automation Account.
 
 ---
 
@@ -281,10 +281,10 @@ Complete list of all variables for this option:
 | `INTUNE_TENANT_ID` | Both | Tenant ID (SP mode only) |
 | `INTUNE_CLIENT_ID` | Both | Client ID (SP mode only) |
 | `INTUNE_CLIENT_SECRET` | Both | Client secret (SP mode only, encrypted) |
-| `INTUNE_POLICY_ID` | macOS | macOS policy GUID |
-| `PIN_TO_MAJOR_VERSION` | macOS | Pin to macOS major version |
-| `VERSIONS_BELOW` | macOS | Versions behind latest (default: 2) |
-| `USE_MINOR_VERSIONS` | macOS | Track minor versions (default: false) |
+| `MACOS_POLICY_ID` | macOS | macOS policy GUID |
+| `MACOS_PIN_TO_MAJOR_VERSION` | macOS | Pin to macOS major version |
+| `MACOS_VERSIONS_BELOW` | macOS | Versions behind latest (default: 2) |
+| `MACOS_USE_MINOR_VERSIONS` | macOS | Track minor versions (default: false) |
 | `IOS_POLICY_ID` | iOS | iOS/iPadOS policy GUID |
 | `IOS_PIN_TO_MAJOR_VERSION` | iOS | Pin to iOS major version |
 | `IOS_VERSIONS_BELOW` | iOS | Versions behind latest (default: 2) |
@@ -294,13 +294,13 @@ Complete list of all variables for this option:
 
 ## Troubleshooting
 
-### "Could not load variables" on iOS diagnostics
+### "Could not load variables" on diagnostics
 
-The iOS runbook uses `IOS_POLICY_ID` (not `INTUNE_POLICY_ID`). Verify the variable name exactly.
+The macOS runbook uses `MACOS_POLICY_ID`, and the iOS runbook uses `IOS_POLICY_ID`. Verify the variable names exactly.
 
 ### Policy type mismatch warning
 
-Step 4 of each diagnostics script warns if the policy ID points to the wrong platform. Make sure `INTUNE_POLICY_ID` points to a macOS policy and `IOS_POLICY_ID` points to an iOS/iPadOS policy.
+Step 4 of each diagnostics script warns if the policy ID points to the wrong platform. Make sure `MACOS_POLICY_ID` points to a macOS policy and `IOS_POLICY_ID` points to an iOS/iPadOS policy.
 
 ### Authentication fails on one runbook but not the other
 

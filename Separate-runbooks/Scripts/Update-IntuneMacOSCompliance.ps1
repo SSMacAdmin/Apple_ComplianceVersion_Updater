@@ -51,7 +51,7 @@
     $env:INTUNE_TENANT_ID = "xxx"
     $env:INTUNE_CLIENT_ID = "xxx"
     $env:INTUNE_CLIENT_SECRET = "xxx"
-    $env:INTUNE_POLICY_ID = "xxx"
+    $env:MACOS_POLICY_ID = "xxx"
     .\Update-IntuneMacOSCompliance.ps1
 
 .EXAMPLE
@@ -60,7 +60,7 @@
 
 .NOTES
     Author: Niklas Bruhn (SSMacAdmin.com)
-    Version: 4.0
+    Version: 4.1.0
     Platform: macOS
 
     Azure Automation Variables:
@@ -111,7 +111,7 @@ param(
     [switch]$RunTests
 )
 
-#Requires -Version 5.1
+
 
 # ============================================================================
 # GLOBAL VARIABLES
@@ -119,6 +119,131 @@ param(
 $script:testMode = $RunTests
 $script:isAzureAutomation = $false
 $script:logEntries = @()
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+function ConvertTo-RunbookBoolean {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return $Value }
+
+    $stringValue = $Value.ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) { return $Default }
+
+    switch -Regex ($stringValue) {
+        '^(true|1|yes|y)$'  { return $true }
+        '^(false|0|no|n)$'  { return $false }
+        default             { return $Default }
+    }
+}
+
+function Test-TransientRestError {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    if ($response -and $response.StatusCode) {
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -eq 429 -or $statusCode -ge 500) { return $true }
+    }
+
+    if ($ErrorRecord.Exception -is [System.Net.WebException]) {
+        return $ErrorRecord.Exception.Status -in @(
+            [System.Net.WebExceptionStatus]::Timeout,
+            [System.Net.WebExceptionStatus]::ConnectFailure,
+            [System.Net.WebExceptionStatus]::ConnectionClosed,
+            [System.Net.WebExceptionStatus]::NameResolutionFailure,
+            [System.Net.WebExceptionStatus]::ReceiveFailure,
+            [System.Net.WebExceptionStatus]::SendFailure
+        )
+    }
+
+    return ($ErrorRecord.Exception.Message -match 'timed out|timeout|temporarily unavailable')
+}
+
+function Get-RetryAfterSeconds {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    try {
+        $retryAfter = $ErrorRecord.Exception.Response.Headers['Retry-After']
+        if ($retryAfter) {
+            $seconds = 0
+            if ([int]::TryParse($retryAfter.ToString(), [ref]$seconds) -and $seconds -gt 0) {
+                return [Math]::Min($seconds, 60)
+            }
+        }
+    } catch { }
+
+    return $null
+}
+
+function Invoke-RestMethodWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Method = 'Get',
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $false)]
+        $Body,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSec,
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxRetries = 3
+    )
+
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $params = @{
+                Uri         = $Uri
+                Method      = $Method
+                ErrorAction = 'Stop'
+            }
+            if ($Headers) { $params.Headers = $Headers }
+            if ($null -ne $Body) { $params.Body = $Body }
+            if ($TimeoutSec -gt 0) { $params.TimeoutSec = $TimeoutSec }
+
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $isTransient = Test-TransientRestError -ErrorRecord $_
+            if (-not $isTransient -or $attempt -ge $MaxRetries) { throw }
+
+            $delay = Get-RetryAfterSeconds -ErrorRecord $_
+            if ($null -eq $delay) { $delay = [Math]::Min([Math]::Pow(2, $attempt), 30) }
+
+            Write-Log "Transient REST failure on attempt $attempt/$MaxRetries. Retrying in $delay seconds. Error: $($_.Exception.Message)" -Level WARNING
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+function Assert-VersionsBelow {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($Value -lt 1 -or $Value -gt 10) {
+        throw "$Name must be between 1 and 10. Current value: $Value"
+    }
+}
 
 # ============================================================================
 # LOGGING FUNCTIONS
@@ -184,7 +309,7 @@ function Get-Configuration {
             try {
                 $miEnabled = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
                 if ($null -ne $miEnabled) {
-                    $useManagedIdentity = [bool]$miEnabled
+                    $useManagedIdentity = ConvertTo-RunbookBoolean -Value $miEnabled
                     if ($useManagedIdentity) { Write-Log "Managed Identity mode enabled" -Level INFO }
                 }
             } catch { }
@@ -206,7 +331,7 @@ function Get-Configuration {
 
             try {
                 $umv = Get-AutomationVariable -Name "MACOS_USE_MINOR_VERSIONS" -ErrorAction SilentlyContinue
-                if ($null -ne $umv) { $config.UseMinorVersions = [bool]$umv }
+                if ($null -ne $umv) { $config.UseMinorVersions = ConvertTo-RunbookBoolean -Value $umv }
             } catch { }
 
             try {
@@ -252,6 +377,8 @@ function Get-Configuration {
         throw "Configuration incomplete"
     }
 
+    Assert-VersionsBelow -Value $config.VersionsBelow -Name "MACOS_VERSIONS_BELOW"
+
     Write-Log "Configuration loaded successfully" -Level SUCCESS
     Write-Log "  Authentication: $(if ($config.UseManagedIdentity) { 'Managed Identity' } else { 'Service Principal' })" -Level DEBUG
     Write-Log "  Policy ID: $($config.CompliancePolicyId.Substring(0,8))..." -Level DEBUG
@@ -285,7 +412,7 @@ function Test-Prerequisites {
 
     Write-Log "Testing SOFA API access..." -Level INFO
     try {
-        $test = Invoke-RestMethod -Uri "https://sofa.macadmins.io/v2/macos_data_feed.json" -Method Get -TimeoutSec 10 -ErrorAction Stop
+        $test = Invoke-RestMethodWithRetry -Uri "https://sofa.macadmins.io/v2/macos_data_feed.json" -Method Get -TimeoutSec 10
         if ($test -and $test.OSVersions) {
             Write-Log "  SOFA API accessible ($($test.OSVersions.Count) major versions)" -Level SUCCESS
         }
@@ -313,7 +440,7 @@ function Get-MacOSVersionsFromSOFA {
         $sofaUrl = "https://sofa.macadmins.io/v2/macos_data_feed.json"
         Write-Log "Querying: $sofaUrl" -Level DEBUG
 
-        $response = Invoke-RestMethod -Uri $sofaUrl -Method Get -TimeoutSec 30 -ErrorAction Stop
+        $response = Invoke-RestMethodWithRetry -Uri $sofaUrl -Method Get -TimeoutSec 30
 
         if ($null -eq $response -or $null -eq $response.OSVersions) {
             throw "No OS versions returned from SOFA API"
@@ -329,6 +456,7 @@ function Get-MacOSVersionsFromSOFA {
                     build       = $majorVersion.Latest.Build
                     released    = $true
                     releaseDate = $majorVersion.Latest.ReleaseDate
+                    deviceScope = $majorVersion.Latest.DeviceScope
                 }
             }
             if ($majorVersion.SecurityReleases) {
@@ -338,6 +466,7 @@ function Get-MacOSVersionsFromSOFA {
                         build       = $sec.Build
                         released    = $true
                         releaseDate = $sec.ReleaseDate
+                        deviceScope = $sec.DeviceScope
                     }
                 }
             }
@@ -373,8 +502,12 @@ function Get-SortedMacOSVersions {
 
     Write-Log "Parsing macOS versions..." -Level INFO
 
-    $released = $Builds | Where-Object { $_.version -notmatch 'beta|rc|preview|seed' }
+    $released = $Builds | Where-Object {
+        $_.version -notmatch 'beta|rc|preview|seed' -and
+        ([string]::IsNullOrWhiteSpace($_.deviceScope) -or $_.deviceScope -eq 'universal')
+    }
     Write-Log "Found $($released.Count) released versions" -Level INFO
+    Write-Log "Device-specific releases are excluded from compliance minimum calculations" -Level DEBUG
 
     $parsed = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($build in $released) {
@@ -392,6 +525,7 @@ function Get-SortedMacOSVersions {
                 MinorVersion = $minor
                 PatchVersion = $patch
                 ReleaseDate  = if ($build.releaseDate) { $build.releaseDate } else { "Unknown" }
+                DeviceScope  = if ($build.deviceScope) { $build.deviceScope } else { "Unknown" }
                 FullVersion  = "$major.$minor.$patch"
             })
         }
@@ -476,7 +610,7 @@ function Get-GraphAccessToken {
         try {
             $resourceUri   = "https://graph.microsoft.com"
             $tokenAuthUri  = $env:IDENTITY_ENDPOINT + "?resource=$resourceUri&api-version=2019-08-01"
-            $tokenResponse = Invoke-RestMethod -Method Get -Headers @{"X-IDENTITY-HEADER" = $env:IDENTITY_HEADER} -Uri $tokenAuthUri
+            $tokenResponse = Invoke-RestMethodWithRetry -Method Get -Headers @{"X-IDENTITY-HEADER" = $env:IDENTITY_HEADER} -Uri $tokenAuthUri
             Write-Log "Managed Identity authentication successful" -Level SUCCESS
             return $tokenResponse.access_token
         }
@@ -495,7 +629,7 @@ function Get-GraphAccessToken {
                 client_secret = $ClientSecret
                 scope         = "https://graph.microsoft.com/.default"
             }
-            $response = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body -ErrorAction Stop
+            $response = Invoke-RestMethodWithRetry -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body
             Write-Log "Service Principal authentication successful" -Level SUCCESS
             return $response.access_token
         }
@@ -522,7 +656,12 @@ function Get-IntuneCompliancePolicy {
             "Authorization" = "Bearer $AccessToken"
             "Content-Type"  = "application/json"
         }
-        $policy = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Get -ErrorAction Stop
+        $policy = Invoke-RestMethodWithRetry -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Get
+
+        $expectedType = "#microsoft.graph.macOSCompliancePolicy"
+        if ($policy.'@odata.type' -ne $expectedType) {
+            throw "Policy type mismatch. Expected $expectedType, got $($policy.'@odata.type')"
+        }
 
         Write-Log "Retrieved policy: $($policy.displayName)" -Level SUCCESS
         Write-Log "Current OS minimum version: $($policy.osMinimumVersion)" -Level INFO
@@ -563,9 +702,16 @@ function Update-IntuneCompliancePolicy {
             osMinimumVersion = $NewMinimumVersion
         } | ConvertTo-Json
 
-        $null = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+        $policyUrl = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId"
+        $null = Invoke-RestMethodWithRetry -Uri $policyUrl -Headers $headers -Method Patch -Body $body
+
+        $verifiedPolicy = Invoke-RestMethodWithRetry -Uri $policyUrl -Headers $headers -Method Get
+        if ($verifiedPolicy.osMinimumVersion -ne $NewMinimumVersion) {
+            throw "Post-update verification failed. Expected osMinimumVersion '$NewMinimumVersion', got '$($verifiedPolicy.osMinimumVersion)'"
+        }
 
         Write-Log "Successfully updated macOS compliance policy" -Level SUCCESS
+        Write-Log "Verified minimum OS version: $($verifiedPolicy.osMinimumVersion)" -Level SUCCESS
         Write-Log "New minimum OS version: $NewMinimumVersion" -Level SUCCESS
         return $true
     }
@@ -632,7 +778,7 @@ function Main {
 
         # Step 6: Compare and update
         Write-Log "" -Level INFO
-        if ($policy.osMinimumVersion -eq $target.FullVersion) {
+        if ($policy.osMinimumVersion -eq $target.Version) {
             Write-Log "========================================" -Level SUCCESS
             Write-Log "macOS POLICY IS UP TO DATE" -Level SUCCESS
             Write-Log "========================================" -Level SUCCESS
@@ -646,10 +792,10 @@ function Main {
             Write-Log "========================================" -Level WARNING
             Write-Log "Policy: $($policy.displayName)" -Level INFO
             Write-Log "Current: $($policy.osMinimumVersion)" -Level WARNING
-            Write-Log "New:     $($target.FullVersion)" -Level WARNING
+            Write-Log "New:     $($target.Version)" -Level WARNING
             Write-Log "" -Level INFO
 
-            $success = Update-IntuneCompliancePolicy -AccessToken $token -PolicyId $config.CompliancePolicyId -NewMinimumVersion $target.FullVersion -WhatIf:$config.WhatIf
+            $success = Update-IntuneCompliancePolicy -AccessToken $token -PolicyId $config.CompliancePolicyId -NewMinimumVersion $target.Version -WhatIf:$config.WhatIf
 
             if ($success) {
                 Write-Log "" -Level INFO
@@ -668,8 +814,8 @@ function Main {
             Platform        = "macOS"
             PolicyId        = $config.CompliancePolicyId
             PreviousVersion = $policy.osMinimumVersion
-            NewVersion      = $target.FullVersion
-            Updated         = ($policy.osMinimumVersion -ne $target.FullVersion)
+            NewVersion      = $target.Version
+            Updated         = ($policy.osMinimumVersion -ne $target.Version)
             AuthMethod      = if ($config.UseManagedIdentity) { "Managed Identity" } else { "Service Principal" }
             Duration        = $duration.TotalSeconds
             Timestamp       = Get-Date -Format 'o'

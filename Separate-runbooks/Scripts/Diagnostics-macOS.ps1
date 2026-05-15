@@ -12,9 +12,31 @@
 
 .NOTES
     Author: Niklas Bruhn (SSMacAdmin.com)
-    Version: 4.0
+    Version: 4.1.0
     Platform: macOS
 #>
+
+function ConvertTo-RunbookBoolean {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return $Value }
+
+    $stringValue = $Value.ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) { return $Default }
+
+    switch -Regex ($stringValue) {
+        '^(true|1|yes|y)$'  { return $true }
+        '^(false|0|no|n)$'  { return $false }
+        default             { return $Default }
+    }
+}
 
 Write-Output "========================================="
 Write-Output "macOS Compliance Runbook Diagnostics"
@@ -29,7 +51,7 @@ try {
     $useManagedIdentity = $false
     try {
         $miEnabled = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
-        if ($null -ne $miEnabled) { $useManagedIdentity = [bool]$miEnabled }
+        if ($null -ne $miEnabled) { $useManagedIdentity = ConvertTo-RunbookBoolean -Value $miEnabled }
     } catch { }
 
     if ($useManagedIdentity) {
@@ -216,7 +238,7 @@ try {
         Write-Output "  WARNING: This policy is NOT a macOS policy!"
         Write-Output "  Expected: #microsoft.graph.macOSCompliancePolicy"
         Write-Output "  Got:      $($policy.'@odata.type')"
-        Write-Output "  Update INTUNE_POLICY_ID with the correct macOS policy ID."
+        Write-Output "  Update MACOS_POLICY_ID with the correct macOS policy ID."
     }
     else {
         Write-Output "  RESULT: Policy access successful"
@@ -230,10 +252,10 @@ catch {
     if ($_.Exception.Response.StatusCode.value__ -eq 404) {
         Write-Output ""
         Write-Output "  FIX (404 Not Found):"
-        Write-Output "  - The INTUNE_POLICY_ID value does not match any policy"
+        Write-Output "  - The MACOS_POLICY_ID value does not match any policy"
         Write-Output "  - Go to Intune -> Devices -> Compliance -> Policies"
         Write-Output "  - Click your macOS policy and copy the GUID from the URL"
-        Write-Output "  - Update INTUNE_POLICY_ID variable"
+        Write-Output "  - Update MACOS_POLICY_ID variable"
     }
 
     Write-Output ""

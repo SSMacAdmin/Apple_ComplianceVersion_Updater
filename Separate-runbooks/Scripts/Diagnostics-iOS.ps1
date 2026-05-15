@@ -12,9 +12,31 @@
 
 .NOTES
     Author: Niklas Bruhn (SSMacAdmin.com)
-    Version: 4.0
+    Version: 4.1.0
     Platform: iOS/iPadOS
 #>
+
+function ConvertTo-RunbookBoolean {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return $Value }
+
+    $stringValue = $Value.ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) { return $Default }
+
+    switch -Regex ($stringValue) {
+        '^(true|1|yes|y)$'  { return $true }
+        '^(false|0|no|n)$'  { return $false }
+        default             { return $Default }
+    }
+}
 
 Write-Output "========================================="
 Write-Output "iOS/iPadOS Compliance Runbook Diagnostics"
@@ -29,7 +51,7 @@ try {
     $useManagedIdentity = $false
     try {
         $miEnabled = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
-        if ($null -ne $miEnabled) { $useManagedIdentity = [bool]$miEnabled }
+        if ($null -ne $miEnabled) { $useManagedIdentity = ConvertTo-RunbookBoolean -Value $miEnabled }
     } catch { }
 
     if ($useManagedIdentity) {

@@ -57,7 +57,7 @@
 
 .NOTES
     Author: Niklas Bruhn (SSMacAdmin.com)
-    Version: 4.0
+    Version: 4.1.0
 
     Azure Automation Variables:
 
@@ -120,7 +120,7 @@ param(
     [switch]$RunTests
 )
 
-#Requires -Version 5.1
+
 
 # ============================================================================
 # GLOBAL VARIABLES
@@ -128,6 +128,131 @@ param(
 $script:testMode          = $RunTests
 $script:isAzureAutomation = $false
 $script:logEntries        = @()
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+function ConvertTo-RunbookBoolean {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return $Value }
+
+    $stringValue = $Value.ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($stringValue)) { return $Default }
+
+    switch -Regex ($stringValue) {
+        '^(true|1|yes|y)$'  { return $true }
+        '^(false|0|no|n)$'  { return $false }
+        default             { return $Default }
+    }
+}
+
+function Test-TransientRestError {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    if ($response -and $response.StatusCode) {
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -eq 429 -or $statusCode -ge 500) { return $true }
+    }
+
+    if ($ErrorRecord.Exception -is [System.Net.WebException]) {
+        return $ErrorRecord.Exception.Status -in @(
+            [System.Net.WebExceptionStatus]::Timeout,
+            [System.Net.WebExceptionStatus]::ConnectFailure,
+            [System.Net.WebExceptionStatus]::ConnectionClosed,
+            [System.Net.WebExceptionStatus]::NameResolutionFailure,
+            [System.Net.WebExceptionStatus]::ReceiveFailure,
+            [System.Net.WebExceptionStatus]::SendFailure
+        )
+    }
+
+    return ($ErrorRecord.Exception.Message -match 'timed out|timeout|temporarily unavailable')
+}
+
+function Get-RetryAfterSeconds {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    try {
+        $retryAfter = $ErrorRecord.Exception.Response.Headers['Retry-After']
+        if ($retryAfter) {
+            $seconds = 0
+            if ([int]::TryParse($retryAfter.ToString(), [ref]$seconds) -and $seconds -gt 0) {
+                return [Math]::Min($seconds, 60)
+            }
+        }
+    } catch { }
+
+    return $null
+}
+
+function Invoke-RestMethodWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Method = 'Get',
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $false)]
+        $Body,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSec,
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxRetries = 3
+    )
+
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $params = @{
+                Uri         = $Uri
+                Method      = $Method
+                ErrorAction = 'Stop'
+            }
+            if ($Headers) { $params.Headers = $Headers }
+            if ($null -ne $Body) { $params.Body = $Body }
+            if ($TimeoutSec -gt 0) { $params.TimeoutSec = $TimeoutSec }
+
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $isTransient = Test-TransientRestError -ErrorRecord $_
+            if (-not $isTransient -or $attempt -ge $MaxRetries) { throw }
+
+            $delay = Get-RetryAfterSeconds -ErrorRecord $_
+            if ($null -eq $delay) { $delay = [Math]::Min([Math]::Pow(2, $attempt), 30) }
+
+            Write-Log "Transient REST failure on attempt $attempt/$MaxRetries. Retrying in $delay seconds. Error: $($_.Exception.Message)" -Level WARNING
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+function Assert-VersionsBelow {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($Value -lt 1 -or $Value -gt 10) {
+        throw "$Name must be between 1 and 10. Current value: $Value"
+    }
+}
 
 # ============================================================================
 # LOGGING
@@ -220,7 +345,7 @@ function Get-Configuration {
             $useMI = $false
             try {
                 $miVar = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
-                if ($null -ne $miVar) { $useMI = [bool]$miVar }
+                if ($null -ne $miVar) { $useMI = ConvertTo-RunbookBoolean -Value $miVar }
             } catch { }
 
             $config.UseManagedIdentity = $useMI
@@ -234,12 +359,12 @@ function Get-Configuration {
             # Platform toggles
             try {
                 $enMac = Get-AutomationVariable -Name "ENABLE_MACOS" -ErrorAction SilentlyContinue
-                if ($null -ne $enMac) { $config.EnableMacOS = [bool]$enMac }
+                if ($null -ne $enMac) { $config.EnableMacOS = ConvertTo-RunbookBoolean -Value $enMac }
             } catch { }
 
             try {
                 $enIOS = Get-AutomationVariable -Name "ENABLE_IOS" -ErrorAction SilentlyContinue
-                if ($null -ne $enIOS) { $config.EnableIOS = [bool]$enIOS }
+                if ($null -ne $enIOS) { $config.EnableIOS = ConvertTo-RunbookBoolean -Value $enIOS }
             } catch { }
 
             # macOS settings
@@ -253,7 +378,7 @@ function Get-Configuration {
 
                 try {
                     $u = Get-AutomationVariable -Name "MACOS_USE_MINOR_VERSIONS" -ErrorAction SilentlyContinue
-                    if ($null -ne $u) { $config.MacOS.UseMinorVersions = [bool]$u }
+                    if ($null -ne $u) { $config.MacOS.UseMinorVersions = ConvertTo-RunbookBoolean -Value $u }
                 } catch { }
 
                 try {
@@ -273,7 +398,7 @@ function Get-Configuration {
 
                 try {
                     $u = Get-AutomationVariable -Name "IOS_USE_MINOR_VERSIONS" -ErrorAction SilentlyContinue
-                    if ($null -ne $u) { $config.IOS.UseMinorVersions = [bool]$u }
+                    if ($null -ne $u) { $config.IOS.UseMinorVersions = ConvertTo-RunbookBoolean -Value $u }
                 } catch { }
 
                 try {
@@ -337,6 +462,13 @@ function Get-Configuration {
         throw "Configuration incomplete"
     }
 
+    if ($config.EnableMacOS) {
+        Assert-VersionsBelow -Value $config.MacOS.VersionsBelow -Name "MACOS_VERSIONS_BELOW"
+    }
+    if ($config.EnableIOS) {
+        Assert-VersionsBelow -Value $config.IOS.VersionsBelow -Name "IOS_VERSIONS_BELOW"
+    }
+
     # Log summary
     Write-Log "Configuration loaded successfully" -Level SUCCESS
     Write-Log "  Auth: $(if ($config.UseManagedIdentity) { 'Managed Identity' } else { 'Service Principal' })" -Level DEBUG
@@ -386,7 +518,7 @@ function Test-Prerequisites {
     if ($Config.EnableMacOS) {
         Write-Log "Testing SOFA macOS feed..." -Level INFO
         try {
-            $test = Invoke-RestMethod -Uri "https://sofa.macadmins.io/v2/macos_data_feed.json" -Method Get -TimeoutSec 10 -ErrorAction Stop
+            $test = Invoke-RestMethodWithRetry -Uri "https://sofa.macadmins.io/v2/macos_data_feed.json" -Method Get -TimeoutSec 10
             if ($test -and $test.OSVersions) {
                 Write-Log "  SOFA macOS accessible ($($test.OSVersions.Count) major versions)" -Level SUCCESS
             }
@@ -404,7 +536,7 @@ function Test-Prerequisites {
     if ($Config.EnableIOS) {
         Write-Log "Testing SOFA iOS feed..." -Level INFO
         try {
-            $test = Invoke-RestMethod -Uri "https://sofa.macadmins.io/v2/ios_data_feed.json" -Method Get -TimeoutSec 10 -ErrorAction Stop
+            $test = Invoke-RestMethodWithRetry -Uri "https://sofa.macadmins.io/v2/ios_data_feed.json" -Method Get -TimeoutSec 10
             if ($test -and $test.OSVersions) {
                 Write-Log "  SOFA iOS accessible ($($test.OSVersions.Count) major versions)" -Level SUCCESS
             }
@@ -440,7 +572,7 @@ function Get-SOFAVersions {
     Write-Log "  URL: $feedUrl" -Level DEBUG
 
     try {
-        $response = Invoke-RestMethod -Uri $feedUrl -Method Get -TimeoutSec 30 -ErrorAction Stop
+        $response = Invoke-RestMethodWithRetry -Uri $feedUrl -Method Get -TimeoutSec 30
 
         if ($null -eq $response -or $null -eq $response.OSVersions) {
             throw "No OS versions returned from SOFA $label feed"
@@ -454,6 +586,7 @@ function Get-SOFAVersions {
                     build       = $majorVersion.Latest.Build
                     released    = $true
                     releaseDate = $majorVersion.Latest.ReleaseDate
+                    deviceScope = $majorVersion.Latest.DeviceScope
                 }
             }
             if ($majorVersion.SecurityReleases) {
@@ -463,6 +596,7 @@ function Get-SOFAVersions {
                         build       = $sec.Build
                         released    = $true
                         releaseDate = $sec.ReleaseDate
+                        deviceScope = $sec.DeviceScope
                     }
                 }
             }
@@ -500,8 +634,12 @@ function Get-SortedVersions {
     $label = if ($Platform -eq 'macos') { 'macOS' } else { 'iOS/iPadOS' }
     Write-Log "Parsing $label versions..." -Level INFO
 
-    $released = $Builds | Where-Object { $_.version -notmatch 'beta|rc|preview|seed' }
+    $released = $Builds | Where-Object {
+        $_.version -notmatch 'beta|rc|preview|seed' -and
+        ([string]::IsNullOrWhiteSpace($_.deviceScope) -or $_.deviceScope -eq 'universal')
+    }
     Write-Log "  Released versions: $($released.Count)" -Level INFO
+    Write-Log "  Device-specific releases are excluded from compliance minimum calculations" -Level DEBUG
 
     $parsed = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($build in $released) {
@@ -519,6 +657,7 @@ function Get-SortedVersions {
                 MinorVersion = $minor
                 PatchVersion = $patch
                 ReleaseDate  = if ($build.releaseDate) { $build.releaseDate } else { "Unknown" }
+                DeviceScope  = if ($build.deviceScope) { $build.deviceScope } else { "Unknown" }
                 FullVersion  = "$major.$minor.$patch"
             })
         }
@@ -602,7 +741,7 @@ function Get-GraphAccessToken {
         try {
             $resourceUri   = "https://graph.microsoft.com"
             $tokenAuthUri  = $env:IDENTITY_ENDPOINT + "?resource=$resourceUri&api-version=2019-08-01"
-            $tokenResponse = Invoke-RestMethod -Method Get -Headers @{"X-IDENTITY-HEADER" = $env:IDENTITY_HEADER} -Uri $tokenAuthUri
+            $tokenResponse = Invoke-RestMethodWithRetry -Method Get -Headers @{"X-IDENTITY-HEADER" = $env:IDENTITY_HEADER} -Uri $tokenAuthUri
             Write-Log "Managed Identity authentication successful" -Level SUCCESS
             return $tokenResponse.access_token
         }
@@ -620,7 +759,7 @@ function Get-GraphAccessToken {
                 client_secret = $ClientSecret
                 scope         = "https://graph.microsoft.com/.default"
             }
-            $response = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body -ErrorAction Stop
+            $response = Invoke-RestMethodWithRetry -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body
             Write-Log "Service Principal authentication successful" -Level SUCCESS
             return $response.access_token
         }
@@ -649,7 +788,17 @@ function Get-IntuneCompliancePolicy {
             "Authorization" = "Bearer $AccessToken"
             "Content-Type"  = "application/json"
         }
-        $policy = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Get -ErrorAction Stop
+        $policy = Invoke-RestMethodWithRetry -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Get
+        $expectedType = if ($Platform -eq 'macos') {
+            "#microsoft.graph.macOSCompliancePolicy"
+        }
+        else {
+            "#microsoft.graph.iosCompliancePolicy"
+        }
+
+        if ($policy.'@odata.type' -ne $expectedType) {
+            throw "Policy type mismatch. Expected $expectedType, got $($policy.'@odata.type')"
+        }
 
         Write-Log "  Policy: $($policy.displayName)" -Level SUCCESS
         Write-Log "  Current OS minimum: $($policy.osMinimumVersion)" -Level INFO
@@ -699,9 +848,16 @@ function Update-IntuneCompliancePolicy {
             osMinimumVersion = $NewMinimumVersion
         } | ConvertTo-Json
 
-        $null = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId" -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+        $policyUrl = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$PolicyId"
+        $null = Invoke-RestMethodWithRetry -Uri $policyUrl -Headers $headers -Method Patch -Body $body
+
+        $verifiedPolicy = Invoke-RestMethodWithRetry -Uri $policyUrl -Headers $headers -Method Get
+        if ($verifiedPolicy.osMinimumVersion -ne $NewMinimumVersion) {
+            throw "Post-update verification failed. Expected osMinimumVersion '$NewMinimumVersion', got '$($verifiedPolicy.osMinimumVersion)'"
+        }
 
         Write-Log "$label policy updated successfully" -Level SUCCESS
+        Write-Log "Verified minimum: $($verifiedPolicy.osMinimumVersion)" -Level SUCCESS
         Write-Log "New minimum: $NewMinimumVersion" -Level SUCCESS
         return $true
     }
@@ -756,7 +912,7 @@ function Invoke-PlatformUpdate {
         $policy = Get-IntuneCompliancePolicy -AccessToken $AccessToken -PolicyId $PlatformConfig.PolicyId -Platform $Platform
 
         # Compare and update
-        if ($policy.osMinimumVersion -eq $target.FullVersion) {
+        if ($policy.osMinimumVersion -eq $target.Version) {
             Write-Log "$label policy is up to date ($($policy.osMinimumVersion))" -Level SUCCESS
             return @{
                 Success         = $true
@@ -764,17 +920,17 @@ function Invoke-PlatformUpdate {
                 PolicyId        = $PlatformConfig.PolicyId
                 PolicyName      = $policy.displayName
                 PreviousVersion = $policy.osMinimumVersion
-                NewVersion      = $target.FullVersion
+                NewVersion      = $target.Version
                 Updated         = $false
             }
         }
         else {
-            Write-Log "$label update required: $($policy.osMinimumVersion) -> $($target.FullVersion)" -Level WARNING
+            Write-Log "$label update required: $($policy.osMinimumVersion) -> $($target.Version)" -Level WARNING
 
             $success = Update-IntuneCompliancePolicy `
                 -AccessToken       $AccessToken `
                 -PolicyId          $PlatformConfig.PolicyId `
-                -NewMinimumVersion $target.FullVersion `
+                -NewMinimumVersion $target.Version `
                 -Platform          $Platform `
                 -WhatIf            $WhatIf
 
@@ -784,7 +940,7 @@ function Invoke-PlatformUpdate {
                 PolicyId        = $PlatformConfig.PolicyId
                 PolicyName      = $policy.displayName
                 PreviousVersion = $policy.osMinimumVersion
-                NewVersion      = $target.FullVersion
+                NewVersion      = $target.Version
                 Updated         = $true
             }
         }
